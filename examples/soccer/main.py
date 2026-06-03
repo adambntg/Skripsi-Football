@@ -83,13 +83,6 @@ class Mode(Enum):
     RADAR = 'RADAR'
     EXTRACT = 'EXTRACT'
 
-class DistanceMethod(Enum):
-    EUCLIDEAN = "euclidean"
-    MANHATTAN = "manhattan"
-    CANBERRA = "canberra"
-    CHEBYSHEV = "chebyshev"
-    MAHALANOBIS = "mahalanobis"
-
 
 def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
     """
@@ -332,54 +325,51 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
             annotated_frame, detections, labels, custom_color_lookup=color_lookup)
         yield annotated_frame
 
-def calculate_ball_possession(player_coords, ball_coords, players_team_id, method=DistanceMethod.EUCLIDEAN):
+def calculate_ball_possession(players: sv.Detections, ball: sv.Detections, 
+                              players_team_id: np.ndarray, method: str = 'euclidean') -> int:
     """
-    Hanya menerima koordinat yang SUDAH ditransformasi (Numpy Array dalam CM).
+    Menentukan team_id mana yang menguasai bola berdasarkan metrik jarak yang dipilih.
+    Mendukung: 'euclidean', 'manhattan', dan 'canberra'.
     """
-   # 1. Validasi awal
-    if len(ball_coords) == 0 or len(player_coords) == 0:
-        return None, None
+    if len(ball) == 0 or len(players) == 0:
+        return None
     
-    # 2. FIX BROADCASTING: Ambil hanya 1 bola terdeteksi
-    # Jika ball_coords berbentuk (N, 2), ambil baris pertama [0]
-    if ball_coords.ndim > 1:
-        ball_coords = ball_coords[0]
+    if len(ball) > 1:
+        ball = ball[0]
 
-    distances = None
-    threshold = 150 
+    player_coords = players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+    ball_coords = ball.get_anchors_coordinates(sv.Position.CENTER)
 
-    # Tambahkan pengecekan string sebagai pengaman (safety net)
-    # agar tetap jalan meski yang terkirim adalah string dari CLI
-    if isinstance(method, str):
-        try:
-            method = DistanceMethod[method.upper()]
-        except KeyError:
-            method = DistanceMethod.EUCLIDEAN
-    # Pemilihan Algoritma berdasarkan Enum
-    if method == DistanceMethod.EUCLIDEAN:
+    # 4. Perhitungan Jarak Berdasarkan Metode (Referensi: Faisal dkk., 2020)
+    if method == 'euclidean':
         distances = np.linalg.norm(player_coords - ball_coords, axis=1)
-        threshold = 150 # cm
-    
-    elif method == DistanceMethod.MANHATTAN:
+        threshold = 50  # Satuan cm/pixel
+        
+    elif method == 'manhattan':
         distances = np.sum(np.abs(player_coords - ball_coords), axis=1)
-        threshold = 200 # cm
-
-    elif method == DistanceMethod.CANBERRA:
+        threshold = 70  # Nilai lebih tinggi karena sifat penjumlahannya linear
+        
+    elif method == 'canberra':
+        # sum(|xi - yi| / (|xi| + |yi|)) - Rasio Ternormalisasi
         num = np.abs(player_coords - ball_coords)
         den = np.abs(player_coords) + np.abs(ball_coords) + 1e-10
+        # axis=1 menjumlahkan rasio sumbu X dan Y
         distances = np.sum(num / den, axis=1)
-        threshold = 1.2 # rasio
+        threshold = 0.5  # Skala Canberra adalah 0-2 untuk data 2D
+        
+    else:
+        raise ValueError("Metode tidak dikenal. Pilih: 'euclidean', 'manhattan', atau 'canberra'.")
 
-    elif method == DistanceMethod.CHEBYSHEV:
-        # Berdasarkan referensi, Chebyshev mengambil selisih maksimal antar sumbu[cite: 3]
-        distances = np.max(np.abs(player_coords - ball_coords), axis=1)
-        threshold = 150 # cm
+    # 5. Cari Pemain Terdekat
+    closest_player_index = np.argmin(distances)
+    min_distance = distances[closest_player_index]
 
-    closest_idx = np.argmin(distances)
-    if distances[closest_idx] <= threshold:
-        return players_team_id[closest_idx], closest_idx
-    
-    return None, None
+    # 6. Validasi Jarak terhadap Threshold
+    if min_distance > threshold: 
+        return None 
+        
+    # 7. Kembalikan team_id pemain pemenang
+    return players_team_id[closest_player_index]
 
 def save_tracking_results(tracking_data, output_path="tracking_data.csv"):
     """Menyimpan seluruh histori pergerakan ke CSV."""
@@ -427,15 +417,19 @@ def run_tracking_extraction(source_video_path: str, device: str, output_csv: str
         keypoints = sv.KeyPoints.from_ultralytics(pitch_res)
         raw_detections = sv.Detections.from_ultralytics(player_res)
         
+        # Update Tracker (Hanya untuk pemain, kiper, wasit)
         non_ball_detections = raw_detections[raw_detections.class_id != BALL_CLASS_ID]
         tracked_detections = tracker.update_with_detections(non_ball_detections)
         
+        # Deteksi Bola (Tanpa Tracker)
         ball_detections = sv.Detections.from_ultralytics(ball_res)
 
+        # Pisahkan kelas untuk klasifikasi tim
         players = tracked_detections[tracked_detections.class_id == PLAYER_CLASS_ID]
         goalkeepers = tracked_detections[tracked_detections.class_id == GOALKEEPER_CLASS_ID]
         referees = tracked_detections[tracked_detections.class_id == REFEREE_CLASS_ID]
 
+        # Prediksi Tim
         if len(players) > 0:
             players_team_id = team_classifier.predict(get_crops(frame, players))
         else:
@@ -446,8 +440,11 @@ def run_tracking_extraction(source_video_path: str, device: str, output_csv: str
         else:
             goalkeepers_team_id = np.array([])
 
+        # --- SINKRONISASI MERGE & COLOR LOOKUP (Mencegah IndexError) ---
+        # Kita merge dengan urutan: Player -> Goalkeeper -> Referee
         merged_detections = sv.Detections.merge([players, goalkeepers, referees])
         
+        # Bangun color_lookup dengan urutan yang sama persis dengan merge
         ids_list = []
         ids_list.extend(players_team_id.tolist())
         ids_list.extend(goalkeepers_team_id.tolist())
@@ -482,6 +479,7 @@ def run_tracking_extraction(source_video_path: str, device: str, output_csv: str
                             'confidence': player_confidences[i]
                         })
 
+            # Ekstrak Data Bola
             if len(ball_detections) > 0:
                 ball_pixel = ball_detections.get_anchors_coordinates(sv.Position.CENTER)
                 ball_radar = transformer.transform_points(points=ball_pixel)
@@ -502,24 +500,28 @@ def run_tracking_extraction(source_video_path: str, device: str, output_csv: str
 
 
 
-def run_radar(source_video_path: str, device: str, method: DistanceMethod = DistanceMethod.EUCLIDEAN) -> Iterator[np.ndarray]:
+def run_radar(source_video_path: str, device: str, method: str = 'euclidean', output_csv: str = "possession_stats_radar.csv") -> Iterator[np.ndarray]:
+    """
+    Menjalankan deteksi radar dan kalkulasi possession secara real-time, 
+    serta menyimpan histori statistik ke dalam file CSV.
+    """
+    # 1. Inisialisasi Model
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
     ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
 
+    # 2. Inisialisasi Variabel Statistik & Logging
+    possession_records = [] 
     frame_idx = 0
-    count_team_0 = 0  # Pink
-    count_team_1 = 0  # Blue
+    count_team_0 = 0  # Pink Team
+    count_team_1 = 0  # Blue Team
     total_possession_frames = 0
-
-    #for covariance mahalanobis
-    all_p_coords = []
-
     last_possession_team = None
 
-    frame_generator = sv.get_video_frames_generator(source_path=source_video_path, stride=STRIDE)
+    # 3. Fit Team Classifier (Proses Stride untuk Hemat Memori)
+    frame_generator_samples = sv.get_video_frames_generator(source_path=source_video_path, stride=STRIDE)
     crops = []
-    for frame in tqdm(frame_generator, desc='collecting crops'):
+    for frame in tqdm(frame_generator_samples, desc='Collecting team crops'):
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
         crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
@@ -527,107 +529,118 @@ def run_radar(source_video_path: str, device: str, method: DistanceMethod = Dist
     team_classifier = TeamClassifier(device=device)
     team_classifier.fit(crops)
 
-    inv_cov = None
-    # if method == DistanceMethod.MAHALANOBIS and len(all_p_coords) > 0:
-    #     cov_matrix = np.cov(np.array(all_p_coords), rowvar=False)
-    #     inv_cov = np.linalg.inv(cov_matrix)
-
-    # 2. Main Loop
+    # 4. Main Loop Pemrosesan Video
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
-    tracker = sv.ByteTrack(minimum_consecutive_frames=3) 
-
+    tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    
     for frame in frame_generator:
-        # Deteksi
-        pitch_res = pitch_detection_model(frame, verbose=False)[0]
-        player_res = player_detection_model(frame, imgsz=1280, verbose=False)[0]
-        ball_res = ball_detection_model(frame, imgsz=640, verbose=False)[0] # Naikkan imgsz bola ke 1280
-
-        keypoints = sv.KeyPoints.from_ultralytics(pitch_res)
-        detections = sv.Detections.from_ultralytics(player_res)
-        detections = tracker.update_with_detections(detections)
-        ball_detections = sv.Detections.from_ultralytics(ball_res)
-
-        # Klasifikasi Tim
-        players = detections[detections.class_id == PLAYER_CLASS_ID]
-        crops = get_crops(frame, players)
-        players_team_id = team_classifier.predict(crops) if len(crops) > 0 else np.array([])
-
-        # --- LOGIKA SINKRONISASI UNIT (CM) ---
-        current_ball_possession_team = None
+        # Deteksi Lapangan (Keypoints)
+        result_pitch = pitch_detection_model(frame, verbose=False)[0]
+        keypoints = sv.KeyPoints.from_ultralytics(result_pitch)
         
-        # Transformasi Koordinat ke Radar (CM) dulu sebelum hitung Possession
-        mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
-        if mask.sum() >= 4 and len(players) > 0 and len(ball_detections) > 0:
-            transformer = ViewTransformer(
-                source=keypoints.xy[0][mask].astype(np.float32),
-                target=np.array(CONFIG.vertices)[mask].astype(np.float32)
-            )
+        # Deteksi Pemain & Tracking
+        result_player = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+        detections = sv.Detections.from_ultralytics(result_player)
+        detections = tracker.update_with_detections(detections)
 
-            # Koordinat Pemain & Bola dalam CM
-            player_coords_radar = transformer.transform_points(points=players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER))
-            ball_coords_radar = transformer.transform_points(points=ball_detections.get_anchors_coordinates(sv.Position.CENTER))
-            
-            # Hitung Possession menggunakan koordinat CM
-            # Pastikan fungsi ini menerima numpy array (p_coords_radar)
-            # Di dalam run_radar, ubah bagian ini:
-            current_ball_possession_team, _ = calculate_ball_possession(
-                player_coords=player_coords_radar,  # Gunakan player_coords, bukan players
-                ball_coords=ball_coords_radar,    # Gunakan ball_coords, bukan ball
-                players_team_id=players_team_id,
-                method=method
-            )
+        # Deteksi Bola
+        result_ball = ball_detection_model(frame, imgsz=640, verbose=False)[0]
+        ball_detections = sv.Detections.from_ultralytics(result_ball)
 
+        # Klasifikasi Tim Pemain
+        players = detections[detections.class_id == PLAYER_CLASS_ID]
+        if len(players) > 0:
+            players_team_id = team_classifier.predict(get_crops(frame, players))
+        else:
+            players_team_id = np.array([])
+
+        # --- LOGIKA POSSESSION (SINKRON DENGAN VIDEO) ---
+        current_ball_possession_team = calculate_ball_possession(
+            players=players, 
+            ball=ball_detections, 
+            players_team_id=players_team_id,
+            method=method
+        )
+        
+        # Logika Persistence (Mengingat pemilik terakhir)
         if current_ball_possession_team is not None:
-                last_possession_team = current_ball_possession_team
+            last_possession_team = current_ball_possession_team
 
-        # --- Annotasi Frame (Sama seperti sebelumnya) ---
+        # Akumulasi statistik per frame
+        if last_possession_team == 0:
+            count_team_0 += 1
+            total_possession_frames += 1
+            possession_label = "POSSESSION: PINK TEAM"
+            text_color = (147, 20, 255) 
+        elif last_possession_team == 1:
+            count_team_1 += 1
+            total_possession_frames += 1
+            possession_label = "POSSESSION: BLUE TEAM"
+            text_color = (255, 191, 0)
+        else:
+            possession_label = "POSSESSION: SEARCHING..."
+            text_color = (255, 255, 255)
+
         annotated_frame = frame.copy()
 
-        
-
-# Logika penambahan statistik berdasarkan pemilik terakhir (Continuous)
-    if last_possession_team == 0:
-        count_team_0 += 1
-        total_possession_frames += 1
-        possession_label, text_color = "POSSESSION: PINK TEAM", (147, 20, 255)
-
-    elif last_possession_team == 1:
-        count_team_1 += 1
-        total_possession_frames += 1
-        possession_label, text_color = "POSSESSION: BLUE TEAM", (255, 191, 0)
-    else:
-    # Benar-benar belum ada yang menyentuh bola sejak awal video
-        possession_label, text_color = "POSSESSION: NO POSSESSION", (255, 255, 255)
-
-        # Draw Stats & Possession
+        # Render Teks Persentase ke Video
         if total_possession_frames > 0:
-            stat_text = f"PINK: {(count_team_0/total_possession_frames)*100:.1f}% | BLUE: {(count_team_1/total_possession_frames)*100:.1f}%"
-            cv2.putText(annotated_frame, stat_text, (50, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-        
-        cv2.putText(annotated_frame, possession_label, (50, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, text_color, 3)
+            perc_0 = (count_team_0 / total_possession_frames) * 100
+            perc_1 = (count_team_1 / total_possession_frames) * 100
+            stat_text = f"PINK: {perc_0:.1f}% | BLUE: {perc_1:.1f}%"
+            
+            cv2.putText(annotated_frame, stat_text, (50, 110), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            
+            # SIMPAN DATA KE LIST UNTUK CSV (Forward Filling otomatis)
+            possession_records.append({
+                'frame': frame_idx,
+                'team_id': last_possession_team,
+                'pink_perc': round(perc_0, 2),
+                'blue_perc': round(perc_1, 2)
+            })
 
-        # Merge untuk Annotator Ellipse
+        cv2.putText(annotated_frame, possession_label, (50, 60), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, text_color, 3)
+
+        # Resolusi Tim Kiper & Wasit
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
         goalkeepers_team_id = resolve_goalkeepers_team_id(players, players_team_id, goalkeepers)
         referees = detections[detections.class_id == REFEREE_CLASS_ID]
-        
-        merged_detections = sv.Detections.merge([players, goalkeepers, referees])
-        color_lookup = np.array(players_team_id.tolist() + goalkeepers_team_id.tolist() + [REFEREE_CLASS_ID] * len(referees))
-        
-        annotated_frame = ELLIPSE_ANNOTATOR.annotate(annotated_frame, merged_detections, custom_color_lookup=color_lookup)
-        annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(annotated_frame, merged_detections, [str(tid) for tid in merged_detections.tracker_id], custom_color_lookup=color_lookup)
 
-        # Radar Minimap
+        # Merge semua untuk Anotasi
+        detections_all = sv.Detections.merge([players, goalkeepers, referees])
+        color_lookup = np.array(
+            players_team_id.tolist() +
+            goalkeepers_team_id.tolist() +
+            [REFEREE_CLASS_ID] * len(referees)
+        )
+        labels = [str(tracker_id) for tracker_id in detections_all.tracker_id] if detections_all.tracker_id is not None else []
+
+        # Gambar Anotasi ke Frame
+        annotated_frame = ELLIPSE_ANNOTATOR.annotate(annotated_frame, detections_all, custom_color_lookup=color_lookup)
+        annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(annotated_frame, detections_all, labels, custom_color_lookup=color_lookup)
+
+        # Render & Overlay Radar
         h, w, _ = frame.shape
-        radar_img = render_radar(merged_detections, keypoints, color_lookup, current_ball_possession_team)
-        radar_img = sv.resize_image(radar_img, (w // 4, h // 4))
-        annotated_frame = sv.draw_image(annotated_frame, radar_img, opacity=0.5, rect=sv.Rect(x=w//2 - (w//8), y=h - (h//4), width=w//4, height=h//4))
+        radar = render_radar(detections_all, keypoints, color_lookup, last_possession_team)
+        radar = sv.resize_image(radar, (w // 4, h // 4))
+        radar_h, radar_w, _ = radar.shape
+        rect = sv.Rect(x=w // 2 - radar_w // 2, y=h - radar_h, width=radar_w, height=radar_h)
+        annotated_frame = sv.draw_image(annotated_frame, radar, opacity=0.5, rect=rect)
 
+        frame_idx += 1
         yield annotated_frame
 
+    # 5. Save Statistik Final ke CSV
+    if possession_records:
+        df_stats = pd.DataFrame(possession_records)
+        df_stats.to_csv(output_csv, index=False)
+        print(f"\n[INFO] Statistik possession berhasil diekstrak ke {output_csv}")
 
 
-def main(source_video_path: str, target_video_path: str, device: str, mode: Mode, method: DistanceMethod) -> None:
+
+def main(source_video_path: str, target_video_path: str, device: str, mode: Mode, method: str) -> None:
     if mode == Mode.PITCH_DETECTION:
         frame_generator = run_pitch_detection(
             source_video_path=source_video_path, device=device)
@@ -669,7 +682,9 @@ if __name__ == '__main__':
     parser.add_argument('--target_video_path', type=str, required=True)
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--mode', type=Mode, default=Mode.RADAR)
-    parser.add_argument('--method', type=str, default='euclidean')
+    parser.add_argument('--method', type=str, default='euclidean', 
+                        choices=['euclidean', 'manhattan', 'canberra'],
+                        help="Metode perhitungan jarak")
     args = parser.parse_args()
     main(
         source_video_path=args.source_video_path,
